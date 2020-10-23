@@ -1,203 +1,14 @@
 #!/usr/bin/env python
 
-#
-# (c) 2015, Steve Gargan <steve.gargan@gmail.com>
-#
-# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
-
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
-
-######################################################################
-
-'''
-Consul.io inventory script (http://consul.io)
-======================================
-
-Generates Ansible inventory from nodes in a Consul cluster. This script will
-group nodes by:
- - datacenter,
- - registered service
- - service tags
- - service status
- - values from the k/v store
-
-This script can be run with the switches
---list as expected groups all the nodes in all datacenters
---datacenter, to restrict the nodes to a single datacenter
---host to restrict the inventory to a single named node. (requires datacenter config)
-
-The configuration for this plugin is read from a consul_io.ini file located in the
-same directory as this inventory script. All config options in the config file
-are optional except the host and port, which must point to a valid agent or
-server running the http api. For more information on enabling the endpoint see.
-
-http://www.consul.io/docs/agent/options.html
-
-Other options include:
-
-'datacenter':
-
-which restricts the included nodes to those from the given datacenter
-This can also be set with the environmental variable CONSUL_DATACENTER
-
-'url':
-
-the URL of the Consul cluster. host, port and scheme are derived from the
-URL. If not specified, connection configuration defaults to http requests
-to localhost on port 8500.
-This can also be set with the environmental variable CONSUL_URL
-
-'domain':
-
-if specified then the inventory will generate domain names that will resolve
-via Consul's inbuilt DNS. The name is derived from the node name, datacenter
-and domain <node_name>.node.<datacenter>.<domain>. Note that you will need to
-have consul hooked into your DNS server for these to resolve. See the consul
-DNS docs for more info.
-
-which restricts the included nodes to those from the given datacenter
-
-'servers_suffix':
-
-defining the a suffix to add to the service name when creating the service
-group. e.g Service name of 'redis' and a suffix of '_servers' will add
-each nodes address to the group name 'redis_servers'. No suffix is added
-if this is not set
-
-'tags':
-
-boolean flag defining if service tags should be used to create Inventory
-groups e.g. an nginx service with the tags ['master', 'v1'] will create
-groups nginx_master and nginx_v1 to which the node running the service
-will be added. No tag groups are created if this is missing.
-
-'token':
-
-ACL token to use to authorize access to the key value store. May be required
-to retrieve the kv_groups and kv_metadata based on your consul configuration.
-
-'kv_groups':
-
-This is used to lookup groups for a node in the key value store. It specifies a
-path to which each discovered node's name will be added to create a key to query
-the key/value store. There it expects to find a comma separated list of group
-names to which the node should be added e.g. if the inventory contains node
-'nyc-web-1' in datacenter 'nyc-dc1' and kv_groups = 'ansible/groups' then the key
-'ansible/groups/nyc-dc1/nyc-web-1' will be queried for a group list. If this query
- returned 'test,honeypot' then the node address to both groups.
-
-'kv_metadata':
-
-kv_metadata is used to lookup metadata for each discovered node. Like kv_groups
-above it is used to build a path to lookup in the kv store where it expects to
-find a json dictionary of metadata entries. If found, each key/value pair in the
-dictionary is added to the metadata for the node. eg node 'nyc-web-1' in datacenter
-'nyc-dc1' and kv_metadata = 'ansible/metadata', then the key
-'ansible/metadata/nyc-dc1/nyc-web-1' should contain '{"databse": "postgres"}'
-
-'availability':
-
-if true then availability groups will be created for each service. The node will
-be added to one of the groups based on the health status of the service. The
-group name is derived from the service name and the configurable availability
-suffixes
-
-'available_suffix':
-
-suffix that should be appended to the service availability groups for available
-services e.g. if the suffix is '_up' and the service is nginx, then nodes with
-healthy nginx services will be added to the nginix_up group. Defaults to
-'_available'
-
-'unavailable_suffix':
-
-as above but for unhealthy services, defaults to '_unavailable'
-
-Note that if the inventory discovers an 'ssh' service running on a node it will
-register the port as ansible_ssh_port in the node's metadata and this port will
-be used to access the machine.
-```
-
-'''
-
-import os
-import re
-import argparse
-import sys
-
-from ansible.module_utils.six.moves import configparser
-
-
-def get_log_filename():
-    tty_filename = '/dev/tty'
-    stdout_filename = '/dev/stdout'
-
-    if not os.path.exists(tty_filename):
-        return stdout_filename
-    if not os.access(tty_filename, os.W_OK):
-        return stdout_filename
-    if os.getenv('TEAMCITY_VERSION'):
-        return stdout_filename
-
-    return tty_filename
-
-
-def setup_logging():
-    filename = get_log_filename()
-
-    import logging.config
-    logging.config.dictConfig({
-        'version': 1,
-        'formatters': {
-            'simple': {
-                'format': '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            },
-        },
-        'root': {
-            'level': os.getenv('ANSIBLE_INVENTORY_CONSUL_IO_LOG_LEVEL', 'WARN'),
-            'handlers': ['console'],
-        },
-        'handlers': {
-            'console': {
-                'class': 'logging.FileHandler',
-                'filename': filename,
-                'formatter': 'simple',
-            },
-        },
-        'loggers': {
-            'iso8601': {
-                'qualname': 'iso8601',
-                'level': 'INFO',
-            },
-        },
-    })
-    logger = logging.getLogger('consul_io.py')
-    logger.debug('Invoked with %r', sys.argv)
-
-
-if os.getenv('ANSIBLE_INVENTORY_CONSUL_IO_LOG_ENABLED'):
-    setup_logging()
-
-
 import json
+import re
 import yaml
 
-try:
-    import consul
-except ImportError as e:
-    sys.exit("""failed=True msg='python-consul required for this module.
-See https://python-consul.readthedocs.io/en/latest/#installation'""")
-
 from ansible.module_utils.six import iteritems
-
-
-class Result(object):
-    pass
+from consul_config import ConsulConfig
 
 
 class ConsulInventory(object):
-
     def __init__(self):
         ''' Create an inventory based on the catalog of nodes and services
         registered in a consul cluster'''
@@ -209,24 +20,29 @@ class ConsulInventory(object):
         self.nodes_by_kv = {}
         self.nodes_by_availability = {}
         self.current_dc = None
+
         self.inmemory_kv = []
         self.inmemory_nodes = []
 
-        config = ConsulConfig()
-        self.config = config
+        self.config = ConsulConfig()
+        self.consul_api = self.config.get_consul_api()
 
-        self.consul_api = config.get_consul_api()
-
-        if config.has_config('datacenter'):
-            if config.has_config('host'):
-                self.load_data_for_node(config.host, config.datacenter)
+        if self.config.has_config('datacenter'):
+            if self.config.has_config('host'):
+                self.load_data_for_node(self.config.host, self.config.datacenter)
             else:
-                self.load_data_for_datacenter(config.datacenter)
+                self.load_data_for_datacenter(self.config.datacenter)
         else:
             self.load_all_data_consul()
 
-        self.combine_all_results()
-        print(json.dumps(self.inventory, sort_keys=True, indent=2))
+    def build_inventory(self):
+        inventory = {"_meta": {"hostvars": self.node_metadata}}
+        groupings = [self.nodes, self.nodes_by_datacenter, self.nodes_by_service,
+                     self.nodes_by_tag, self.nodes_by_kv, self.nodes_by_availability]
+        for grouping in groupings:
+            for name, addresses in grouping.items():
+                inventory[name] = sorted(list(set(addresses)))
+        return inventory
 
     def bulk_load(self, datacenter):
         index, groups_list = self.consul_api.kv.get(self.config.kv_groups, recurse=True, dc=datacenter)
@@ -244,6 +60,20 @@ class ConsulInventory(object):
             self.current_dc = datacenter
             self.bulk_load(datacenter)
             self.load_data_for_datacenter(datacenter)
+
+    def load_metadata(self, key):
+        if self.config.bulk_load == 'true':
+            metadata = self.consul_get_kv_inmemory(key)
+        else:
+            index, metadata = self.consul_api.kv.get(key)
+        return metadata
+
+    def load_nodes(self, datacenter):
+        if self.config.bulk_load == 'true':
+            nodes = self.inmemory_nodes
+        else:
+            index, nodes = self.consul_api.catalog.nodes(dc=datacenter)
+        return nodes
 
     def load_availability_groups(self, node, datacenter):
         '''check the health of each service on a node and add the node to either
@@ -282,10 +112,7 @@ class ConsulInventory(object):
 
     def load_data_for_datacenter(self, datacenter):
         '''processes all the nodes in a particular datacenter'''
-        if self.config.bulk_load == 'true':
-            nodes = self.inmemory_nodes
-        else:
-            index, nodes = self.consul_api.catalog.nodes(dc=datacenter)
+        nodes = self.load_nodes(datacenter)
         for node in nodes:
             self.add_node_to_map(self.nodes_by_datacenter, datacenter, node)
             self.load_data_for_node(node['Node'], datacenter)
@@ -318,10 +145,7 @@ class ConsulInventory(object):
         node = node_data['Node']
         if self.config.has_config('kv_metadata'):
             key = "%s/%s/%s" % (self.config.kv_metadata, self.current_dc, node['Node'])
-            if self.config.bulk_load == 'true':
-                metadata = self.consul_get_kv_inmemory(key)
-            else:
-                index, metadata = self.consul_api.kv.get(key)
+            metadata = self.load_metadata(key)
             if metadata and metadata['Value']:
                 try:
                     metadata = yaml.safe_load(metadata['Value'])
@@ -373,15 +197,6 @@ class ConsulInventory(object):
             for tag in service['Tags']:
                 tagname = service_name + '_' + tag
                 self.add_node_to_map(self.nodes_by_tag, tagname, node_data['Node'])
-
-    def combine_all_results(self):
-        '''prunes and sorts all groupings for combination into the final map'''
-        self.inventory = {"_meta": {"hostvars": self.node_metadata}}
-        groupings = [self.nodes, self.nodes_by_datacenter, self.nodes_by_service,
-                     self.nodes_by_tag, self.nodes_by_kv, self.nodes_by_availability]
-        for grouping in groupings:
-            for name, addresses in grouping.items():
-                self.inventory[name] = sorted(list(set(addresses)))
 
     def add_metadata(self, node_data, key, value, is_list=False):
         ''' Pushed an element onto a metadata dict for the node, creating
@@ -443,91 +258,4 @@ class ConsulInventory(object):
         return new_seq
 
 
-class ConsulConfig(dict):
-
-    def __init__(self):
-        self.read_settings()
-        self.read_cli_args()
-        self.read_env_vars()
-
-    def has_config(self, name):
-        if hasattr(self, name):
-            return getattr(self, name)
-        else:
-            return False
-
-    def read_settings(self):
-        ''' Reads the settings from the consul_io.ini file (or consul.ini for backwards compatibility)'''
-        config = configparser.SafeConfigParser()
-        if os.path.isfile(os.path.dirname(os.path.realpath(__file__)) + '/consul_io.ini'):
-            config.read(os.path.dirname(os.path.realpath(__file__)) + '/consul_io.ini')
-        else:
-            config.read(os.path.dirname(os.path.realpath(__file__)) + '/consul.ini')
-
-        config_options = ['host', 'token', 'datacenter', 'servers_suffix',
-                          'tags', 'kv_metadata', 'kv_groups', 'availability',
-                          'unavailable_suffix', 'available_suffix', 'url',
-                          'domain', 'suffixes', 'bulk_load']
-        for option in config_options:
-            value = None
-            if config.has_option('consul', option):
-                value = config.get('consul', option).lower()
-            setattr(self, option, value)
-
-    def read_cli_args(self):
-        ''' Command line argument processing '''
-        parser = argparse.ArgumentParser(description='Produce an Ansible Inventory file based nodes in a Consul cluster')
-
-        parser.add_argument('--list', action='store_true',
-                            help='Get all inventory variables from all nodes in the consul cluster')
-        parser.add_argument('--host', action='store',
-                            help='Get all inventory variables about a specific consul node,'
-                                 'requires datacenter set in consul.ini.')
-        parser.add_argument('--datacenter', action='store',
-                            help='Get all inventory about a specific consul datacenter')
-
-        args = parser.parse_args()
-        arg_names = ['host', 'datacenter']
-
-        for arg in arg_names:
-            if getattr(args, arg):
-                setattr(self, arg, getattr(args, arg))
-
-    def read_env_vars(self):
-        env_var_options = ['datacenter', 'url']
-        for option in env_var_options:
-            value = None
-            env_var = 'CONSUL_' + option.upper()
-            if os.environ.get(env_var):
-                setattr(self, option, os.environ.get(env_var))
-
-    def get_availability_suffix(self, suffix, default):
-        if self.has_config(suffix):
-            return self.has_config(suffix)
-        return default
-
-    def get_consul_api(self):
-        '''get an instance of the api based on the supplied configuration'''
-        host = 'localhost'
-        port = 8500
-        token = None
-        scheme = 'http'
-
-        if hasattr(self, 'url'):
-            from ansible.module_utils.six.moves.urllib.parse import urlparse
-            o = urlparse(self.url)
-            if o.hostname:
-                host = o.hostname
-            if o.port:
-                port = o.port
-            if o.scheme:
-                scheme = o.scheme
-
-        if hasattr(self, 'token'):
-            token = self.token
-            if not token:
-                token = 'anonymous'
-        return consul.Consul(host=host, port=port, token=token, scheme=scheme)
-
-
-ConsulInventory()
+print(json.dumps(ConsulInventory().build_inventory(), sort_keys=True, indent=2))
