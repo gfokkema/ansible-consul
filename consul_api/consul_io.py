@@ -142,7 +142,7 @@ class ConsulInventory(object):
             metadata '''
         node = node_data['Node']
         if self.config.has_config('kv_metadata'):
-            key = "%s/%s/%s" % (self.config.kv_metadata, self.current_dc, node['Node'])
+            key = "%s/%s/%s/%s" % (self.config.kv_metadata, 'hosts', self.current_dc, node['Node'])
             metadata = self.load_metadata(key)
             if metadata and metadata['Value']:
                 try:

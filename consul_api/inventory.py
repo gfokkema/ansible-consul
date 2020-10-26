@@ -28,7 +28,7 @@ class NewInventory(object):
             nm.update(v.metadata())
             for e in self.groups_for_node(dc, node):
                 nm.update(self.consul.get_metadata('groups', e))
-            nm.update(self.consul.get_metadata(dc, node))
+            nm.update(self.consul.get_metadata('hosts', dc, node))
             metadata[v.fullname()] = nm
         return metadata
 
