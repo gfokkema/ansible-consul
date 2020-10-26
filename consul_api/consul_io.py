@@ -1,11 +1,9 @@
-#!/usr/bin/env python
-
 import json
 import re
 import yaml
 
 from ansible.module_utils.six import iteritems
-from consul_config import ConsulConfig
+from .config import ConsulConfig
 
 
 class ConsulInventory(object):
@@ -167,7 +165,7 @@ class ConsulInventory(object):
             else:
                 index, groups = self.consul_api.kv.get(key)
             if groups and groups['Value']:
-                for group in groups['Value'].split(','):
+                for group in yaml.safe_load(groups['Value']):
                     self.add_node_to_map(self.nodes_by_kv, group.strip(), node)
 
     def load_data_from_service(self, service_name, service, node_data):
@@ -256,6 +254,3 @@ class ConsulInventory(object):
         for d in seq:
             new_seq.append(self.sanitize_dict(d))
         return new_seq
-
-
-print(json.dumps(ConsulInventory().build_inventory(), sort_keys=True, indent=2))
